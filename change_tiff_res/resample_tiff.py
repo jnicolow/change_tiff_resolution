@@ -77,6 +77,20 @@ def resample_tiff(
 
             with rasterio.open(save_path, "w", **profile) as dst:
                 dst.write(resampled)
+                # Preserve dataset-level metadata and per-band naming/tags from source.
+                src_dataset_tags = src.tags()
+                if src_dataset_tags:
+                    dst.update_tags(**src_dataset_tags)
+
+                for band_idx, band_desc in enumerate(src.descriptions, start=1):
+                    if band_desc:
+                        dst.set_band_description(band_idx, band_desc)
+                    band_tags = src.tags(band_idx)
+                    if band_tags:
+                        dst.update_tags(band_idx, **band_tags)
+
+                if src.colorinterp and len(src.colorinterp) == src.count:
+                    dst.colorinterp = src.colorinterp
 
     return result
 
