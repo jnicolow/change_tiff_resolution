@@ -64,6 +64,7 @@ def convert_sites_to_higher_resolution(
 
     for site in site_names:
         site = site.strip()
+        print(f'processing: {site}')
         if not site:
             continue
 
@@ -77,7 +78,7 @@ def convert_sites_to_higher_resolution(
             warnings.warn(f"No TIFF files under {site_src}", stacklevel=2)
             continue
 
-        for tiff_path in tiffs[0:10]:
+        for tiff_path in tiffs:
             rel = tiff_path.relative_to(site_src)
             with rasterio.open(tiff_path) as src:
                 h, w = src.height, src.width
