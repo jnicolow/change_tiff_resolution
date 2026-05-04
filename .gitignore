@@ -1,6 +1,10 @@
 # Data
 data/
 
+# OpenSR demo outputs / cached weights (large)
+opensr_outputs/
+opensr_weights/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
