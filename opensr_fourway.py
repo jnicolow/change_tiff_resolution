@@ -2,9 +2,9 @@
 
 Row 1: original 10 m crop, bilinear/bicubic at ~5 m (×2 pipeline), SEN2SR at ~2.5 m (×4 model).
 
-Row 2: resample originals onto the SEN2SR H×W grid (LR ×4 nearest; bilinear/bicubic ×2 bilinear for
-display), then an identical tight center crop so detail can be compared at the same pixel pitch as
-SEN2SR. Bilinear/bicubic cannot add true 2.5 m detail beyond their ~5 m source; this only aligns grids.
+Row 2: same grid alignment; crop center follows NDWI/Otsu **shoreline nearest the patch center** (not
+the ocean-wide boundary centroid). When ``zoom2_focus='shoreline'``, the **LR window** is also chosen
+from a coarse full-scene NDWI/Otsu map so row 1 usually includes coast, not open ocean.
 
 Uses the same triplet discovery as ``water_index_hr_comparison.ipynb``. SEN2SR uses one ``model(batch)``
 call on a 128×128 LR crop (no ``predict_large`` tiling).
@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import mlstac
 import numpy as np
 import rasterio
+from rasterio.enums import Resampling
 import torch
 import torch.nn.functional as F
 from rasterio.windows import Window
@@ -104,6 +105,85 @@ def center_lr_window(height: int, width: int, side: int) -> Window:
     h = min(side, height - row_off)
     w = min(side, width - col_off)
     return Window(col_off, row_off, w, h)
+
+
+def pick_lr_window_toward_shoreline(
+    path: Path,
+    lr_patch: int,
+    *,
+    coarse_factor: int = 24,
+) -> Window:
+    """Place an ``lr_patch`` window so it covers NDWI/Otsu shoreline near the scene center.
+
+    Uses one or more coarse full-scene reads (cheap). If the first grid misses land/water mix
+    (common with very coarse downsampling on narrow coasts), finer grids are tried before falling
+    back to geometric center.
+    """
+    raw_factors = [
+        coarse_factor,
+        max(8, (coarse_factor * 2 + 1) // 3),
+        max(8, coarse_factor // 2),
+        max(6, coarse_factor // 3),
+        8,
+        6,
+    ]
+    factors: list[int] = []
+    for f in raw_factors:
+        f = int(max(6, f))
+        if f not in factors:
+            factors.append(f)
+
+    with rasterio.open(path) as src:
+        h, w = src.height, src.width
+        names = extract_band_names(src)
+        ri = find_band_index(names, "red")
+        gi = find_band_index(names, "green")
+        bi = find_band_index(names, "blue")
+        ni = find_band_index(names, "nir")
+
+        for cf in factors:
+            ch = max(48, h // cf)
+            cw = max(48, w // cf)
+            ch = min(ch, h)
+            cw = min(cw, w)
+            planes = [
+                src.read(b, out_shape=(ch, cw), resampling=Resampling.average)
+                for b in (ri + 1, gi + 1, bi + 1, ni + 1)
+            ]
+            data = np.stack(planes, axis=0).astype(np.float32)
+
+            stack = to_reflectance_physical(data)
+            ndwi = ndwi_mcfeeters(stack)
+            if not np.any(np.isfinite(ndwi)):
+                continue
+
+            t = otsu_threshold(ndwi)
+            water = (ndwi > t) & np.isfinite(ndwi)
+            frac = float(np.mean(water))
+            if frac < 0.02 or frac > 0.98:
+                continue
+
+            ero = _binary_erode_3x3(water)
+            shore = (water & ~ero) | (
+                (~water) & np.isfinite(ndwi) & ~_binary_erode_3x3((~water) & np.isfinite(ndwi))
+            )
+            if not np.any(shore):
+                continue
+
+            ys, xs = np.nonzero(shore)
+            pr, pc = (ch - 1) / 2.0, (cw - 1) / 2.0
+            d = (ys.astype(np.float64) - pr) ** 2 + (xs.astype(np.float64) - pc) ** 2
+            j = int(np.argmin(d))
+            cy_c, cx_c = int(ys[j]), int(xs[j])
+
+            cr_full = (cy_c + 0.5) * h / ch - 0.5
+            cc_full = (cx_c + 0.5) * w / cw - 0.5
+
+            col_off = int(np.clip(round(cc_full - lr_patch / 2), 0, max(0, w - lr_patch)))
+            row_off = int(np.clip(round(cr_full - lr_patch / 2), 0, max(0, h - lr_patch)))
+            return Window(col_off, row_off, lr_patch, lr_patch)
+
+    return center_lr_window(h, w, lr_patch)
 
 
 def scale_window(win: Window, scale: int) -> Window:
@@ -274,13 +354,15 @@ def _binary_erode_3x3(a: np.ndarray) -> np.ndarray:
     return out
 
 
-def shoreline_centroid_from_ndwi(
+def shoreline_focus_nearest_to_point(
     stack_4: np.ndarray,
+    pref_row: float,
+    pref_col: float,
     *,
     min_water_frac: float = 0.02,
     max_water_frac: float = 0.98,
 ) -> Tuple[float | None, float | None]:
-    """Return ``(row, col)`` centroid of NDWI/Otsu shoreline pixels, or ``(None, None)`` if ambiguous."""
+    """Shoreline pixel (row, col) nearest ``(pref_row, pref_col)`` using NDWI+Otsu edges."""
     ndwi = ndwi_mcfeeters(stack_4)
     if not np.any(np.isfinite(ndwi)):
         return None, None
@@ -291,20 +373,22 @@ def shoreline_centroid_from_ndwi(
     if frac < min_water_frac or frac > max_water_frac:
         return None, None
 
+    finite = np.isfinite(ndwi)
+    land = (~water) & finite
+
     ero = _binary_erode_3x3(water)
     shore_w = water & ~ero
-    if np.any(shore_w):
-        ys, xs = np.nonzero(shore_w)
-        return float(ys.mean()), float(xs.mean())
-
-    land = (~water) & np.isfinite(ndwi)
     ero_l = _binary_erode_3x3(land)
     shore_l = land & ~ero_l
-    if np.any(shore_l):
-        ys, xs = np.nonzero(shore_l)
-        return float(ys.mean()), float(xs.mean())
+    shore = shore_w | shore_l
+    if not np.any(shore):
+        return None, None
 
-    return None, None
+    ys, xs = np.nonzero(shore)
+    dr = ys.astype(np.float64) - pref_row
+    dc = xs.astype(np.float64) - pref_col
+    j = int(np.argmin(dr * dr + dc * dc))
+    return float(ys[j]), float(xs[j])
 
 
 def run_sen2sr_single_patch(
@@ -332,6 +416,7 @@ def save_four_way_figure(
     interp_scale: int = 2,
     zoom2_center_fraction: float = 0.2,
     zoom2_focus: str = "shoreline",
+    lr_shoreline_coarse_factor: int = 24,
     output_path: Path | None = None,
     device: torch.device | None = None,
     model: torch.nn.Module | None = None,
@@ -346,7 +431,15 @@ def save_four_way_figure(
 
     with rasterio.open(scene.original) as src:
         h, w = src.height, src.width
-    win_lr = center_lr_window(h, w, lr_patch)
+
+    if zoom2_focus == "shoreline":
+        win_lr = pick_lr_window_toward_shoreline(
+            scene.original,
+            lr_patch,
+            coarse_factor=lr_shoreline_coarse_factor,
+        )
+    else:
+        win_lr = center_lr_window(h, w, lr_patch)
     win_bi = scale_window(win_lr, interp_scale)
     win_bc = scale_window(win_lr, interp_scale)
 
@@ -404,12 +497,12 @@ def save_four_way_figure(
     zoom_side = max(32, int(min(th, tw) * zoom2_center_fraction))
 
     if zoom2_focus == "shoreline":
-        cy_s, cx_s = shoreline_centroid_from_ndwi(sr)
+        cy_s, cx_s = shoreline_focus_nearest_to_point(sr, (th - 1) / 2.0, (tw - 1) / 2.0)
         if cy_s is None:
             cy_s, cx_s = float(th // 2), float(tw // 2)
-            zoom_note = "geom center (no shoreline in crop)"
+            zoom_note = "geom center (no shoreline in SR patch)"
         else:
-            zoom_note = "NDWI/Otsu shoreline"
+            zoom_note = "NDWI/Otsu shoreline (near patch center)"
     elif zoom2_focus == "center":
         cy_s, cx_s = float(th // 2), float(tw // 2)
         zoom_note = "geom center"
@@ -499,7 +592,14 @@ def main() -> None:
         "--zoom2-focus",
         choices=("shoreline", "center"),
         default="shoreline",
-        help="Second row crop center: NDWI+Otsu shoreline on SEN2SR stack, or image center.",
+        help="When 'shoreline': LR crop is chosen from full-scene NDWI/Otsu (coarse) near image center; "
+        "row-2 zoom uses shoreline nearest patch center on SR. 'center' keeps geometric LR crop.",
+    )
+    parser.add_argument(
+        "--lr-shoreline-coarse",
+        type=int,
+        default=24,
+        help="Full-scene downsample factor for shoreline-based LR placement (larger = faster/coarser).",
     )
     args = parser.parse_args()
 
@@ -526,6 +626,7 @@ def main() -> None:
         interp_scale=args.interp_scale,
         zoom2_center_fraction=args.zoom2_frac,
         zoom2_focus=args.zoom2_focus,
+        lr_shoreline_coarse_factor=args.lr_shoreline_coarse,
         output_path=args.output,
     )
     print("Wrote:", out.resolve())
